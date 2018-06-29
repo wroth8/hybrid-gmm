@@ -33,7 +33,7 @@ class GMMClassifierDiag:
         eta: The parameter for the softmax approximation.
         init_params: Use this to provide initial parameters. Usually parameters
           obtained with the EM algorithm are provided here. init_params must be
-          a five-tuple containing
+          a four-tuple containing
             - mu_vals (K_all x D): Mean values for each component
             - d_rho_vals (D x K_all): Diagonal variances for each component (inverse softplus values)
             - prior_k_rho_vals (K_all): Logits of the component priors
@@ -59,6 +59,7 @@ class GMMClassifierDiag:
             prior_k_rho_vals = np.zeros((K_all,))
             prior_c_rho_vals = np.zeros((C,))
         else:
+            assert len(init_params) == 4
             mu_vals, d_rho_vals, prior_k_rho_vals, prior_c_rho_vals = init_params
             assert mu_vals.shape == (K_all, D)
             assert d_rho_vals.shape == (D, K_all)
@@ -151,3 +152,4 @@ class GMMClassifierDiag:
                   'prior_k_rho' : self.prior_k_rho.get_value(borrow=True),
                   'prior_c_rho' : self.prior_c_rho.get_value(borrow=True)}
         return params
+

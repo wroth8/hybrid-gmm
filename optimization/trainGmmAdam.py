@@ -19,7 +19,10 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
     optim_cfg: Dictionary containing optimization settings. It contains the
       following fields:
       - 'objective': Which objective to use. Must be one of 'hybrid_mm',
-                     'hybrid_cll', 'disc_mm', or 'disc_cll'
+          'hybrid_cll', 'disc_mm', 'disc_cll', 'hybrid_mm_ssl', or
+          'hybrid_cll_ssl'. The SSL objectives should be used in conjunction
+          with GMMClassifierSSL, the other objectives should be used with
+          GMMClassifier(Diag)
       - 'n_batch': The batch size
       - 'n_epochs': Number of epochs to train
       - 'step_size': The step size of the ADAM algorithm
@@ -35,14 +38,16 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
     
     Returns a dictionary with the following fields:
       - 'costs': List containing the cost that is actually being minimized for
-                 each epoch
+           each epoch
       - 'costs_gen': List containing the log-likelihood for each epoch
+      - 'costs_gen_usv': List containing the log-likelihood for the unlabeled
+           data in case of semi-supervised learning, and None otherwise.
       - 'costs_disc': List containing either the MM or the CLL for each epoch
       - 'errs_tr': List containing the error on the training set for each epoch
       - 'errs_va': List containing the error on the validation set for each epoch
       - 'errs_te': List containing the error on the test set for each epoch
       - 'best_model': The parameters of the model resulting in the best
-                      validation performance.
+           validation performance.
     '''
     x_tr_np = np.asarray(x_tr_np, theano.config.floatX)
     x_va_np = np.asarray(x_va_np, theano.config.floatX)
@@ -88,6 +93,16 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
                                 outputs=[gmmc.ce, gmmc.cost_cll, gmmc.cost_nll, gmmc.cost_cll],
                                 givens={gmmc.x:x_tr[start_idx : end_idx],
                                         gmmc.t:t_tr[start_idx : end_idx]})
+    elif optim_cfg['objective'] == 'hybrid_mm_ssl':
+        ce_tr = theano.function(inputs=[start_idx, end_idx],
+                                outputs=[gmmc.ce, gmmc.cost_hybrid_mm, gmmc.cost_nll_sv_normalized, gmmc.cost_nll_usv_normalized, gmmc.cost_mm_normalized],
+                                givens={gmmc.x:x_tr[start_idx : end_idx],
+                                        gmmc.t:t_tr[start_idx : end_idx]})
+    elif optim_cfg['objective'] == 'hybrid_cll_ssl':
+        ce_tr = theano.function(inputs=[start_idx, end_idx],
+                                outputs=[gmmc.ce, gmmc.cost_hybrid_cll, gmmc.cost_nll_sv_normalized, gmmc.cost_nll_usv_normalized, gmmc.cost_cll_normalized],
+                                givens={gmmc.x:x_tr[start_idx : end_idx],
+                                        gmmc.t:t_tr[start_idx : end_idx]})
     else:
         raise Exception('Unknown objective ''%s''' % optim_cfg['objective'])
         
@@ -123,14 +138,21 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
     
     cost = np.zeros((n_batches_tr,), dtype=np.float32)
     cost_gen = np.zeros((n_batches_tr,), dtype=np.float32)
+    cost_gen_usv = np.zeros((n_batches_tr,), dtype=np.float32) # for SSL only
     cost_disc = np.zeros((n_batches_tr,), dtype=np.float32)
     err_tr = np.zeros((n_batches_tr,), dtype=np.float32)
     err_va = np.zeros((n_batches_va,), dtype=np.float32)
     err_te = np.zeros((n_batches_te,), dtype=np.float32)
 
     # Evaluate model on data
-    for batch_idx in range(n_batches_tr):
-        err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
+    if optim_cfg['objective'] == 'hybrid_mm_ssl' or optim_cfg['objective'] == 'hybrid_cll_ssl':
+        for batch_idx in range(n_batches_tr):
+            err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_gen_usv[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
+        costs_gen_usv = [np.average(cost_gen_usv, weights=w_tr)]
+    else:
+        for batch_idx in range(n_batches_tr):
+            err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
+        costs_gen_usv = None
     for batch_idx in range(n_batches_va):
         err_va[batch_idx] = ce_va(i0_va[batch_idx], i1_va[batch_idx])
     for batch_idx in range(n_batches_te):
@@ -145,19 +167,23 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
     best_err_va = np.Inf
     best_model = [p.get_value(borrow=True) for p in gmmc.params]
     if optim_cfg['objective'] == 'hybrid_mm' or optim_cfg['objective'] == 'disc_mm':
-        print 'Epoch %5d/%5d: cost=%1.5e, cost_nll=%1.5e, cost_mm=%1.5e, ce_tr=%2.5f, ce_va=%2.5f, ce_te=%2.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
+        print 'Epoch %5d/%5d: cost=%11.5e, cost_nll=%11.5e, cost_mm=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
     elif optim_cfg['objective'] == 'hybrid_cll' or optim_cfg['objective'] == 'disc_cll':
-        print 'Epoch %5d/%5d: cost=%1.5e, cost_nll=%1.5e, cost_cll=%1.5e, ce_tr=%2.5f, ce_va=%2.5f, ce_te=%2.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
+        print 'Epoch %5d/%5d: cost=%11.5e, cost_nll=%11.5e, cost_cll=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
+    elif optim_cfg['objective'] == 'hybrid_mm_ssl':
+        print 'Epoch %5d/%5d: cost=%11.5e, cost_nll_sv=%11.5e, cost_nll_usv=%11.5e, cost_mm=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_gen_usv[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
+    elif optim_cfg['objective'] == 'hybrid_cll_ssl':
+        print 'Epoch %5d/%5d: cost=%11.5e, cost_nll_sv=%11.5e, cost_nll_usv=%11.5e, cost_cll=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f' % (0, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_gen_usv[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1])
     
     print 'Compiling training function'
-    if optim_cfg['objective'] == 'hybrid_mm':
+    if optim_cfg['objective'] == 'hybrid_mm' or optim_cfg['objective'] == 'hybrid_mm_ssl':
         print 'Training with hybrid-max-margin objective'
         gmm_train = theano.function(inputs=[start_idx, end_idx],
                                     outputs=gmmc.cost_hybrid_mm,
                                     updates=Adam(gmmc.cost_hybrid_mm, gmmc.params, lr=optim_cfg['step_size']),
                                     givens={gmmc.x:x_tr[start_idx : end_idx],
                                             gmmc.t:t_tr[start_idx : end_idx]})
-    elif optim_cfg['objective'] == 'hybrid_cll':
+    elif optim_cfg['objective'] == 'hybrid_cll' or optim_cfg['objective'] == 'hybrid_cll_ssl':
         print 'Training with hybrid-conditional-log-likelihood objective'
         gmm_train = theano.function(inputs=[start_idx, end_idx],
                                     outputs=gmmc.cost_hybrid_cll,
@@ -192,8 +218,13 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
             batch = batches[batch_idx]
             gmm_train(batch[0], batch[1])
 
-        for batch_idx in range(n_batches_tr):
-            err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
+        if optim_cfg['objective'] == 'hybrid_mm_ssl' or optim_cfg['objective'] == 'hybrid_cll_ssl':
+            for batch_idx in range(n_batches_tr):
+                err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_gen_usv[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
+            costs_gen_usv = [np.average(cost_gen_usv, weights=w_tr)]
+        else:
+            for batch_idx in range(n_batches_tr):
+                err_tr[batch_idx], cost[batch_idx], cost_gen[batch_idx], cost_disc[batch_idx] = ce_tr(i0_tr[batch_idx], i1_tr[batch_idx])
         for batch_idx in range(n_batches_va):
             err_va[batch_idx] = ce_va(i0_va[batch_idx], i1_va[batch_idx])
         for batch_idx in range(n_batches_te):
@@ -207,9 +238,13 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
 
         t_elapsed = time() - t_start
         if optim_cfg['objective'] == 'hybrid_mm' or optim_cfg['objective'] == 'disc_mm':
-            print 'Epoch %5d/%5d: cost=%1.5e, cost_nll=%1.5e, cost_mm=%1.5e, ce_tr=%2.5f, ce_va=%2.5f, ce_te=%2.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
+            print 'Epoch %5d/%5d: cost=%11.5e, cost_nll=%11.5e, cost_mm=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
         elif optim_cfg['objective'] == 'hybrid_cll' or optim_cfg['objective'] == 'disc_cll':
-            print 'Epoch %5d/%5d: cost=%1.5e, cost_nll=%1.5e, cost_cll=%1.5e, ce_tr=%2.5f, ce_va=%2.5f, ce_te=%2.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
+            print 'Epoch %5d/%5d: cost=%11.5e, cost_nll=%11.5e, cost_cll=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
+        elif optim_cfg['objective'] == 'hybrid_mm_ssl':
+            print 'Epoch %5d/%5d: cost=%11.5e, cost_nll_sv=%11.5e, cost_nll_usv=%11.5e, cost_mm=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_gen_usv[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
+        elif optim_cfg['objective'] == 'hybrid_cll_ssl':
+            print 'Epoch %5d/%5d: cost=%11.5e, cost_nll_sv=%11.5e, cost_nll_usv=%11.5e, cost_cll=%11.5e, ce_tr=%7.5f, ce_va=%7.5f, ce_te=%7.5f (t_elapsed=%f seconds)' % (epoch_idx, optim_cfg['n_epochs'], costs[-1], costs_gen[-1], costs_gen_usv[-1], costs_disc[-1], errs_tr[-1], errs_va[-1], errs_te[-1], t_elapsed)
     
         if errs_va[-1] < best_err_va:
             print 'err_va improved --> storing model'
@@ -225,14 +260,11 @@ def trainGmmAdam(gmmc, optim_cfg, rng_seed, x_tr_np, t_tr_np, x_va_np, t_va_np, 
         x_tr_np = x_tr_np[randperm[:, None], np.arange(x_tr_np.shape[1])]
         t_tr_np = t_tr_np[randperm]
         x_tr.set_value(x_tr_np, borrow=True)
-        x_va.set_value(x_va_np, borrow=True)
-        x_te.set_value(x_te_np, borrow=True)
         t_tr.set_value(t_tr_np, borrow=True)
-        t_va.set_value(t_va_np, borrow=True)
-        t_te.set_value(t_te_np, borrow=True)
 
     return {'costs':costs,
             'costs_gen':costs_gen,
+            'costs_gen_usv':costs_gen_usv,
             'costs_disc':costs_disc,
             'errs_tr':errs_tr,
             'errs_va':errs_va,

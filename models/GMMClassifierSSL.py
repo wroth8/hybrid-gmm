@@ -1,6 +1,6 @@
 '''
-Theano computation graph that defines the hybrid GMM objectives for DPLR
-covariance matrices from [1].
+Theano computation graph that defines the hybrid GMM objectives for semi-
+supervised learning for DPLR covariance matrices from [1].
 
 [1] Roth W., Peharz R., Tschiatschek S., Pernkopf F., Hybrid generative-
     discriminative training of Gaussian mixture models, Pattern Recognition
@@ -15,8 +15,8 @@ import theano.tensor as T
 
 from theanoOpLogDetPSD import logdet_psd
 
-class GMMClassifier:
-    def __init__(self, C, D, K, S, rng_state=None, epsilon=1e-2, use_precision=True, tradeoff=0.5, gamma=1, eta=10, init_params=None):
+class GMMClassifierSSL:
+    def __init__(self, C, D, K, S, rng_state=None, epsilon=1e-2, use_precision=True, tradeoff_hybrid=0.5, tradeoff_ssl=0.9, gamma=1, eta=10, init_params=None):
         '''
         Constructs the Theano computation graph for the given parameters
         
@@ -32,8 +32,11 @@ class GMMClassifier:
         epsilon: Regularizer for the diagonal of the covariance matrices.
         use_precision: Determines if precisions or covariances should be used.
           The precision is the inverse of the covariance matrix.
-        tradeoff: The lambda parameter of the hybrid objective. Close to 1 means
-          very generative, close to 0 means very discriminative.
+        tradeoff_hybrid: The lambda parameter of the hybrid objective. Close to
+          1 means very generative, close to 0 means very discriminative.
+        tradeoff_ssl: The kappa parameter of the hybrid objective for semi-
+          supervised learning. Close to 1 puts more weight onto the labeled
+          samples, close to 0 puts more weights onto the unlabeled samples.
         gamma: The gamma parameter of the MM/LM objective.
         eta: The parameter for the softmax approximation.
         init_params: Use this to provide initial parameters. Usually parameters
@@ -51,7 +54,8 @@ class GMMClassifier:
         '''
         self.x = T.matrix('x')
         self.t = T.ivector('t')
-        self.tradeoff = tradeoff
+        self.tradeoff_hybrid = tradeoff_hybrid
+        self.tradeoff_ssl = tradeoff_ssl
         self.gamma = gamma
         self.eta = eta
         self.epsilon = epsilon
@@ -63,7 +67,7 @@ class GMMClassifier:
             mu_vals = rng.normal(0., 1., size=(K_all, D))
             s_vals = rng.normal(0., 1., size=(K_all, D, S))
             d_rho_vals = rng.normal(0, 0.1, size=(D, K_all))
-            prior_k_rho_vals = np.zeros((K_all,))
+            prior_k_rho_vals = np.zeros((np.sum(K),))
             prior_c_rho_vals = np.zeros((C,))
         else:
             assert len(init_params) == 5
@@ -106,14 +110,19 @@ class GMMClassifier:
                                          sequences=self.aux_matrix,
                                          non_sequences=None)
             self.logdet = T.sum(T.log(self.d), axis=0) + self.aux_logdet
-
+            
             # logpK contains all log probabilities of all components in an (N x sum(K)) array
             # Note that the log component priors are not added yet
             self.logpK = -0.5 * D * T.log(2. * np.pi) + 0.5 * self.logdet  + self.exponent
         else:
             # s and d are used to represent covariance matrices
-            eye_S = T.eye(S, dtype=theano.config.floatX)
-            self.aux_matrix = T.batched_tensordot(self.s / self.d.T[:,:,None], self.s, axes=(1, 1)) + eye_S
+            if S == 1:
+                self.aux_matrix = T.sum(self.s[:,:,0] / self.d.T * self.s[:,:,0], axis=1).reshape((K_all, 1, 1)) + 1.
+            else:
+                # Since the latest Cuda/Theano update, the following two lines
+                # cause an error in the case of S=1.
+                eye_S = T.eye(S, dtype=theano.config.floatX)
+                self.aux_matrix = T.batched_tensordot(self.s / self.d.T[:,:,None], self.s, axes=(1, 1)) + eye_S
             (self.aux_inv, self.aux_logdet), _ = theano.scan(fn=lambda aux: [T.nlinalg.matrix_inverse(aux), logdet_psd(aux)],
                                                          outputs_info=None,
                                                          sequences=[self.aux_matrix],
@@ -145,47 +154,97 @@ class GMMClassifier:
             k1 = int(np.sum(K[:c]))
             k2 = int(k1 + K[c])
             self.logpC_list.append(self.logpC[:, k1:k2])
-            self.logpC_list[c] += T.log(T.nnet.softmax(self.prior_k_rho[k1:k2]))
+            aux_max = T.max(self.prior_k_rho[k1:k2]) # Compute log-probabilities without division
+            log_prior_k = self.prior_k_rho[k1:k2] - T.log(T.sum(T.exp(self.prior_k_rho[k1:k2] - aux_max))) - aux_max
+            self.logpC_list[c] += log_prior_k
             aux_max = T.max(self.logpC_list[c], axis=1, keepdims=True)
             self.logpC_list[c] = T.log(T.sum(T.exp(self.logpC_list[c] - aux_max), axis=1)) + aux_max.flatten()
         self.logpC = T.stack(self.logpC_list, axis=1)
-        self.logpC += T.log(T.nnet.softmax(self.prior_c_rho))
+        aux_max = T.max(self.prior_c_rho) # Compute log-probabilities without division
+        log_prior_c = self.prior_c_rho - T.log(T.sum(T.exp(self.prior_c_rho - aux_max))) - aux_max
+        self.logpC += log_prior_c 
+
+        # mm and cll objective are only for labeled data
+        # logl objective is slightly different for labeled and unlabeled data
+        idx_sv = T.ge(self.t, 0).nonzero()
+        idx_usv = T.lt(self.t, 0).nonzero()
+        self.logpC_sv = self.logpC[idx_sv]
+        self.logpC_usv = self.logpC[idx_usv]
+        is_sv_empty = T.eq(self.logpC_sv.shape[0], 0)
+        is_usv_empty = T.eq(self.logpC_usv.shape[0], 0)
+        
+        # If there are no supervised/unsupervised samples create a dummy entry
+        # to avoid problems. The corresponding costs are set to 0 later. We set
+        # the number of rows to 2 because 1 results in an error.
+        # The problems appear to be CUDNN related if for instance a sum over an
+        # empty tensor is computed.
+        self.logpC_sv  = theano.ifelse.ifelse(is_sv_empty,  T.zeros((2,C), theano.config.floatX), self.logpC_sv)
+        self.t_sv      = theano.ifelse.ifelse(is_sv_empty,  T.zeros((2,), 'int32')              , self.t[idx_sv])
+        self.logpC_usv = theano.ifelse.ifelse(is_usv_empty, T.zeros((2,C), theano.config.floatX), self.logpC_usv)
+        
+        # Compute mean divisor since T.mean causes divisions by zero if there
+        # are no labeled or unlabeled data in the minibatch. Therefore, we
+        # compute T.mean with T.sum()/N
+        self.aux_mean_divisor_sv = T.switch(is_sv_empty, 1., self.logpC_sv.shape[0])
+        self.aux_mean_divisor_usv = T.switch(is_usv_empty, 1., self.logpC_usv.shape[0])
 
         # Create cost functions
 
-        # Class posterior probabilities
-        self.pt = T.nnet.softmax(self.logpC)
+        # Compute the log of the softmax of logpc which gives the log of the conditional likelihood
+        self.cll_max_tmp = T.max(self.logpC_sv, axis=1, keepdims=True)
+        self.cll_logsumexp = T.log(T.sum(T.exp(self.logpC_sv - self.cll_max_tmp), axis=1)) + T.reshape(self.cll_max_tmp, (self.cll_max_tmp.shape[0],))
+        self.cost_cll = theano.ifelse.ifelse(is_sv_empty, 0., -T.sum(self.logpC_sv[T.arange(self.logpC_sv.shape[0]), self.t_sv] - self.cll_logsumexp))
+        self.cost_cll_normalized = self.cost_cll / self.aux_mean_divisor_sv
         
-        # Conditional log-likelihood
-        self.cost_cll = T.mean(T.nnet.categorical_crossentropy(self.pt, self.t))
+        # Negative log-likelihood of labeled data
+        self.cost_nll_sv = theano.ifelse.ifelse(is_sv_empty, 0., -T.sum(self.logpC_sv[T.arange(self.t_sv.shape[0]), self.t_sv]))
+        self.cost_nll_sv_normalized = self.cost_nll_sv / self.aux_mean_divisor_sv
         
-        # Negative log-likelihood
-        self.cost_nll = -T.mean(self.logpC[T.arange(self.x.shape[0]), self.t])
+        # Negative log-likelihood of unlabeled data
+        self.logpC_usv_max = T.max(self.logpC_usv, axis=1, keepdims=True)
+        self.logpC_usv_logsumexp = T.log(T.sum(T.exp(self.logpC_usv - self.logpC_usv_max), axis=1)) + T.reshape(self.logpC_usv_max, (self.logpC_usv.shape[0],))
+        self.cost_nll_usv = theano.ifelse.ifelse(is_usv_empty, 0., -T.sum(self.logpC_usv_logsumexp))
+        self.cost_nll_usv_normalized = self.cost_nll_usv / self.aux_mean_divisor_usv
         
-        self.margin_start = self.gamma + self.logpC - T.reshape(self.logpC[T.arange(self.x.shape[0]), self.t], (self.x.shape[0], 1))
-        self.margin = self.gamma + self.logpC - T.reshape(self.logpC[T.arange(self.x.shape[0]), self.t], (self.x.shape[0], 1))
+        # Total negative log-likelihood
+        self.cost_nll = self.cost_nll_sv + self.cost_nll_usv
+        self.cost_nll_normalized = self.cost_nll / self.x.shape[0]
+        
+        self.margin_start = self.gamma + self.logpC_sv - T.reshape(self.logpC_sv[T.arange(self.t_sv.shape[0]), self.t_sv], (self.t_sv.shape[0], 1))
+        self.margin = self.gamma + self.logpC_sv - T.reshape(self.logpC_sv[T.arange(self.t_sv.shape[0]), self.t_sv], (self.t_sv.shape[0], 1))
         self.margin *= self.eta
-        self.margin = T.set_subtensor(self.margin[T.arange(self.x.shape[0]), self.t], -np.inf)
+        self.margin = T.set_subtensor(self.margin[T.arange(self.t_sv.shape[0]), self.t_sv], -np.inf)
         
         # Log-sum-exp trick
         self.margin_max_tmp = T.max(self.margin, axis=1, keepdims=True)
         self.max_margin = T.log(T.sum(T.exp(self.margin - self.margin_max_tmp), axis=1)) + T.reshape(self.margin_max_tmp, (self.margin.shape[0],))
         self.max_margin /= self.eta
 
-        self.cost_mm = T.mean(T.nnet.relu(self.max_margin))
+        # The cast in the following statement resolves an error that says that
+        # both paths of ifelse must be of equal type. Setting the dtype argument
+        # of T.sum did not solve the problem.
+        self.cost_mm = theano.ifelse.ifelse(is_sv_empty, 0., T.cast(T.sum(T.nnet.relu(self.max_margin)), theano.config.floatX))
+        self.cost_mm_normalized = self.cost_mm / self.aux_mean_divisor_sv
         
+        # Note: The division by self.x.shape[0] in the following two expressions
+        # ensures that gradients of minibatches are unbiased.
+
         # Cost with CLL criterion
-        self.cost_hybrid_cll = self.tradeoff * self.cost_nll + (1 - self.tradeoff) * self.cost_cll
-        
-        self.cost_hybrid_mm = self.tradeoff * self.cost_nll + (1 - self.tradeoff) * self.cost_mm
-        # Cost with MM criterion
+        self.cost_hybrid_cll = (self.tradeoff_hybrid * (self.tradeoff_ssl * self.cost_nll_sv + (1. - self.tradeoff_ssl) * self.cost_nll_usv) + (1. - self.tradeoff_hybrid) * self.cost_cll) / (self.x.shape[0])
+
+        # Cost with MM criterion        
+        self.cost_hybrid_mm = (self.tradeoff_hybrid * (self.tradeoff_ssl * self.cost_nll_sv + (1. - self.tradeoff_ssl) * self.cost_nll_usv) + (1. - self.tradeoff_hybrid) * self.cost_mm) / (self.x.shape[0])
+
+        # Predictions and classification errors
         self.y = T.argmax(self.logpC, axis=1)
-        self.ce = T.mean(T.neq(self.y, self.t))
+        self.y_sv = self.y[idx_sv]
+        self.y_usv = self.y[idx_usv]
+        self.ce = theano.ifelse.ifelse(is_sv_empty, 0., T.mean(T.neq(self.y_sv, self.t_sv), dtype=theano.config.floatX))
 
     def getParameters(self):
         params = {'mu' : self.means.get_value(borrow=True),
-                  's' : self.s.get_value(borrow=True),
                   'd_rho' : self.d_rho.get_value(borrow=True),
                   'prior_k_rho' : self.prior_k_rho.get_value(borrow=True),
                   'prior_c_rho' : self.prior_c_rho.get_value(borrow=True)}
         return params
+

@@ -57,7 +57,7 @@ def downloadMnist(filename):
         magic, nImages = unpack('>II', f.read(8))
         assert magic == 2049
         assert nImages == 60000
-        t_tr_np = np.fromfile(f, dtype=np.uint8)
+        t_tr_np = np.fromfile(f, dtype=np.int8)
 
     with open(tmp_xTest[:-3], 'rb') as f:
         magic, nImages, nRows, nCols = unpack('>IIII', f.read(16))
@@ -71,7 +71,7 @@ def downloadMnist(filename):
         magic, nImages = unpack('>II', f.read(8))
         assert magic == 2049
         assert nImages == 10000
-        t_te_np = np.fromfile(f, dtype=np.uint8)
+        t_te_np = np.fromfile(f, dtype=np.int8)
         
     x_va_np = x_tr_np[50000:]
     t_va_np = t_tr_np[50000:]

@@ -30,8 +30,8 @@ def downloadMnistBasic(filename):
     print 'Loading uncompressed data...'
     x_tr_np = np.loadtxt(tmp_data_train, dtype=np.float32)
     x_te_np = np.loadtxt(tmp_data_test, dtype=np.float32)
-    t_tr_np = x_tr_np[:, -1].astype(np.uint8)
-    t_te_np = x_te_np[:, -1].astype(np.uint8)
+    t_tr_np = x_tr_np[:, -1].astype(np.int8)
+    t_te_np = x_te_np[:, -1].astype(np.int8)
     x_tr_np = x_tr_np[:, :-1]
     x_te_np = x_te_np[:, :-1]
     x_va_np = x_tr_np[10000:]

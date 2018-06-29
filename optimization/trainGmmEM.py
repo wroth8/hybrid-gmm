@@ -28,34 +28,38 @@ def trainGmmEM(x, t, K, cov_type='full', n_max_iter=500, n_restarts_random=20, n
       
     Returns a dictionary containing all parameters. 
     '''
+    assert n_restarts_random + n_restarts_kmeans > 0
+
     C = int(np.max(t) + 1)
     params = {}
     for c in range(C):
         print 'EM training for class %d/%d with %d components (N=%d, D=%d)' % (c, C, K[c], np.sum(t == c), x.shape[1])
         t_start = time()
-        gmm1 = GaussianMixture(n_components=K[c],
-                               covariance_type=cov_type,
-                               reg_covar=regularize,
-                               max_iter=n_max_iter,
-                               n_init=n_restarts_random,
-                               init_params='random',
-                               verbose=2)
-        gmm1.fit(x[t == c, :])
-        gmm2 = GaussianMixture(n_components=K[c],
-                               covariance_type=cov_type,
-                               reg_covar=regularize,
-                               max_iter=n_max_iter,
-                               n_init=n_restarts_kmeans,
-                               init_params='kmeans',
-                               verbose=2)
-        gmm2.fit(x[t == c, :])
+        if n_restarts_random > 0:
+            gmm1 = GaussianMixture(n_components=K[c],
+                                   covariance_type=cov_type,
+                                   reg_covar=regularize,
+                                   max_iter=n_max_iter,
+                                   n_init=n_restarts_random,
+                                   init_params='random',
+                                   verbose=2)
+            gmm1.fit(x[t == c, :])
+        if n_restarts_kmeans > 0:
+            gmm2 = GaussianMixture(n_components=K[c],
+                                   covariance_type=cov_type,
+                                   reg_covar=regularize,
+                                   max_iter=n_max_iter,
+                                   n_init=n_restarts_kmeans,
+                                   init_params='kmeans',
+                                   verbose=2)
+            gmm2.fit(x[t == c, :])
         t_elapsed = time() - t_start
         print 'EM training for class %d/%d finished in %f seconds' % (c, C, t_elapsed)
 
         # Select the better model of gmm1 and gmm2
         # Don't use gmm.lower_bound_, it returns the last logl and not the best
-        score1 = gmm1.score(x[t == c, :])
-        score2 = gmm2.score(x[t == c, :])
+        score1 = gmm1.score(x[t == c, :]) if n_restarts_random > 0 else -np.Inf
+        score2 = gmm2.score(x[t == c, :]) if n_restarts_kmeans > 0 else -np.Inf
         gmm = gmm1 if score1 > score2 else gmm2
 
         params['alpha_%d' % (c)] = gmm.weights_
